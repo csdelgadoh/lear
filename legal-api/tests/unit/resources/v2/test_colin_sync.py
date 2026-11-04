@@ -486,3 +486,97 @@ def test_get_completed_filings_for_colin_continuation_in_party_shapes(session, c
     # the stored filing json keeps the submitted shape
     assert 'relationships' in relationships_filing.filing_json['filing']['continuationIn']
     assert 'parties' not in relationships_filing.filing_json['filing']['continuationIn']
+
+
+# --- VULN-001: get_last_event_id must not build SQL by interpolating `identifier` ---
+# All identifiers/data below are synthetic test fixtures (see
+# pipeline/04_testdata/output/lear-VULN-001-testdata.md in the governance repo).
+# Business.validate_identifier requires the `(CP|XCP|BC|C|FM)` + 7-digit format,
+# so synthetic fixture identifiers here use a valid prefix with an otherwise
+# arbitrary, clearly-fake 7-digit suffix (consistent with the surrounding test
+# file's existing convention, e.g. CP7654321/BC7654321 above).
+
+def _seed_last_event_id_business(identifier='BC0009001', colin_event_id=424242):
+    """Create a synthetic business with a completed filing and a colin_event_id."""
+    b = factory_business(identifier)
+    factory_business_mailing_address(b)
+    filing = factory_completed_filing(b, ANNUAL_REPORT)
+    event_id = ColinEventId()
+    event_id.colin_event_id = colin_event_id
+    filing.colin_event_ids.append(event_id)
+    filing.save()
+    return b, filing, event_id
+
+
+def test_get_last_event_id_known_identifier(session, client, jwt):
+    """AC5: a legitimate existing identifier still returns 200 with the max colin event id."""
+    _, _, event_id = _seed_last_event_id_business('BC0009001', colin_event_id=424242)
+
+    rv = client.get('/api/v2/businesses/internal/last-event-id/BC0009001',
+                    headers=create_header(jwt, [COLIN_SVC_ROLE]))
+
+    assert rv.status_code == HTTPStatus.OK
+    assert rv.json == {'maxId': event_id.colin_event_id}
+
+
+def test_get_last_event_id_unknown_identifier(session, client, jwt):
+    """AC5: a legitimate non-existent identifier still returns 404."""
+    rv = client.get('/api/v2/businesses/internal/last-event-id/BC0009999',
+                    headers=create_header(jwt, [COLIN_SVC_ROLE]))
+
+    assert rv.status_code == HTTPStatus.NOT_FOUND
+    assert rv.json == {'message': 'No colin ids found'}
+
+
+def test_get_last_event_id_blocks_union_select(session, client, jwt):
+    """AC1/AC2/AC3: a UNION SELECT payload must not leak users-table data.
+
+    Before the fix this returned HTTP 200 with a users.id value via the
+    f-string-built SQL. After the fix the payload is treated as a literal
+    identifier string, so no business matches it and the response is 404.
+    """
+    _seed_last_event_id_business('BC0009001')
+    payload = "BC0009001' UNION SELECT id FROM users ORDER BY 1 -- "
+
+    rv = client.get(f'/api/v2/businesses/internal/last-event-id/{payload}',
+                    headers=create_header(jwt, [COLIN_SVC_ROLE]))
+
+    assert rv.status_code == HTTPStatus.NOT_FOUND
+    assert rv.json == {'message': 'No colin ids found'}
+
+
+def test_get_last_event_id_blocks_boolean_blind_probe(session, client, jwt):
+    """AC3: an always-true injected condition must not act as a boolean oracle.
+
+    Before the fix, appending `' AND 1=1 -- ` to a real identifier still
+    matches the seeded business (same row, condition always true) and
+    returns 200 with its maxId -- proving the injected clause reaches SQL.
+    After the fix, the whole payload is one literal string, so it never
+    matches any business identifier and always returns 404, regardless of
+    the condition's truth value.
+    """
+    _seed_last_event_id_business('BC0009001')
+    true_condition_payload = "BC0009001' AND 1=1 -- "
+
+    rv = client.get(f'/api/v2/businesses/internal/last-event-id/{true_condition_payload}',
+                    headers=create_header(jwt, [COLIN_SVC_ROLE]))
+
+    assert rv.status_code == HTTPStatus.NOT_FOUND
+
+
+def test_get_last_event_id_requires_colin_role(session, client, jwt):
+    """AC4: the role gate on this route is unchanged by the fix."""
+    rv = client.get('/api/v2/businesses/internal/last-event-id/BC0009001',
+                    headers=create_header(jwt, ['public_user']))
+
+    assert rv.status_code == HTTPStatus.UNAUTHORIZED
+    assert rv.json.get('code') == 'missing_a_valid_role'
+
+
+def test_get_last_event_id_benign_special_characters(session, client, jwt):
+    """AC1/AC5: benign identifiers with SQL-adjacent characters are treated as literals, not SQL."""
+    for identifier in ("BC0009'01", 'BC0009&01', 'BC0009%2701'):
+        rv = client.get(f'/api/v2/businesses/internal/last-event-id/{identifier}',
+                        headers=create_header(jwt, [COLIN_SVC_ROLE]))
+        assert rv.status_code == HTTPStatus.NOT_FOUND
+        assert rv.json == {'message': 'No colin ids found'}
